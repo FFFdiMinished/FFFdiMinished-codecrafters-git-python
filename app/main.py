@@ -1,99 +1,156 @@
-import sys
+# pylint: disable=invalid-name,missing-module-docstring
+# pylint: disable=missing-function-docstring
+
+import argparse
+import collections
 import os
-import zlib
-import hashlib
+import sys
+import time
 
-DIR_MODE = 40000
-FILE_MODE = 100644
+from app import repo
+from app.utils import initRepo
+from app.utils import writeGitObj, readGitObj
 
-def hash_blob(content, type = 'blob') -> str:
-    header = f'{type} {len(content)}\0'.encode()
-    content = header + content
-    hash = hashlib.sha1(content).hexdigest()
-    os.makedirs(f".git/objects/{hash[:2]}",exist_ok=True)
-    with open(f".git/objects/{hash[:2]}/{hash[2:]}", "wb") as wb:
-        wb.write(zlib.compress(content))
-    return hash
+TreeObj = collections.namedtuple('TreeObj', ['mode', 'hash', 'name'])
 
-def write_blob(file_path: str) -> str:
-    with open(f"{file_path}", "rb") as f:
-        return hash_blob(f.read())
-        
-def encode_mode(mode, name, hash) -> bytes:
-    return f"{mode} {name}".encode() + b'\0' + bytes.fromhex(hash)
+def initCmd():
+    initRepo()
+    print("Initialized git directory")
 
-def write_tree(root = ".") -> str:
-    hash_map = {}
-    for entry in os.scandir(root):
-        if entry.name.startswith(('.', '_')):
+def catFile(filePath, verbose=False):
+    _, blobData = readGitObj(filePath)
+    if verbose:
+        print(blobData.decode(errors='replace'), end='')
+
+def hashObj(filePath, verbose=False):
+    fileContent = None
+    with open(filePath, 'r') as f:
+        fileContent = f.read()
+
+    objHash = writeGitObj(fileContent.encode(), 'blob')
+    if verbose:
+        print(objHash)
+    return objHash
+
+def lstree(treeHash):
+    tree = []
+
+    _, treeData = readGitObj(treeHash)
+    while treeData:
+        treeData = treeData.split(b' ', 1)[-1] # strip mode
+        name, treeData = treeData.split(b'\x00', 1)
+        treeData = treeData[20:] # strip sha1
+        tree.append(name.decode())
+
+    for fileName in tree:
+        print(fileName)
+
+def writeTree(rootPath=None, verbose=False):
+    blobs = []
+    for fileName in os.listdir(rootPath):
+        if fileName == '.git':
             continue
-        if entry.is_file():
-            hash = write_blob(os.path.join(root, entry.name))
-            hash_map[entry.name] = encode_mode(FILE_MODE, entry.name, hash)
+
+        filePath = os.path.join(rootPath or "", fileName)
+        if os.path.isdir(filePath):
+            sha1 = writeTree(filePath)
+            mode = 0x4000 | os.stat(filePath).st_mode
         else:
-            hash = write_tree(os.path.join(root, entry.name))
-            hash_map[entry.name] = encode_mode(DIR_MODE, entry.name, hash)
-    
-    hash_list = [v for k, v in sorted(hash_map.items())]
+            sha1 = hashObj(filePath)
+            mode = 0x8000 | os.stat(filePath).st_mode
+        blobs.append(TreeObj(name=fileName, hash=sha1, mode=mode))
 
-    content = b''.join(hash_list)
+    content = b""
+    blobs.sort(key=lambda b: b.name)
+    for obj in blobs:
+        content += b"%o %s\x00%s" % (obj.mode,
+                                     obj.name.encode(),
+                                     bytes.fromhex(obj.hash))
 
-    return hash_blob(content, 'tree')
+    treeHash = writeGitObj(content, "tree")
+    if verbose:
+        print(treeHash)
+    return treeHash
 
-def commit_tree(tree_sha, parent_sha, message):
-    content = f"tree {tree_sha}\n parent {parent_sha}\nauthor Anunay <anunay@gmail.com>\ncommiter anunay <anunay@gmail.com>\n\n{message}\n".encode()
-    return hash_blob(content, 'commit')
+def commit(treeRef, parentRef, message):
+    content = b"tree %s\n" % treeRef.encode()
+    content += b"parent %s\n" % parentRef.encode()
+    content += b"author John Doe <john.doe@codecrafter.io> %d %s\n" % (
+        time.time(), time.strftime("%z").encode())
+    content += b"comitter John Doe <john.doe@codecrafter.io> %d %s\n" % (
+        time.time(), time.strftime("%z").encode())
+    content += b"\n"
+    content += b"%s\n" % message.encode()
 
+    commitHash = writeGitObj(content, "commit")
+    print(commitHash)
+
+def clone(url, directory):
+    if not os.path.exists(directory):
+        os.mkdir(directory)
+    repo.clone(url, directory)
 
 def main():
-    # You can use print statements as follows for debugging, they'll be visible when running tests.
-    
-    # cwd = os.getcwd()
+    parser = argparse.ArgumentParser()
+    cmdParser = parser.add_subparsers(dest='cmd')
 
-    command = sys.argv[1]
-    if command == "init":
-        os.mkdir(".git")
-        os.mkdir(".git/objects")
-        os.mkdir(".git/refs")
-        with open(".git/HEAD", "w") as f:
-            f.write("ref: refs/heads/main\n")
-        print("Intialized git directory")
+    # init parser
+    cmdParser.add_parser('init', help='initialize repository')
 
-    elif command == "cat-file":
-        param, hash = sys.argv[2], sys.argv[3]
-        if param == '-p':
-            with open(f".git/objects/{hash[:2]}/{hash[2:]}", "rb") as f:
-                compressed = f.read()
-                content = zlib.decompress(compressed).split(b'\0')[1].decode('utf-8')
-                print(content, end="")
+    # cat-file parser
+    catFileParser = cmdParser.add_parser('cat-file', help='print a given blob')
+    catFileParser.add_argument('-p', help='pretty-print object',
+                               action='store_true', default=False)
+    catFileParser.add_argument('blob', help='blob to print',
+                               action='store', type=str)
 
-    elif command == "hash-object":
-        param, file = sys.argv[2], sys.argv[3]
-        if param == '-w':
-            print(write_blob(file))
+    # hash-object
+    hashObjParser = cmdParser.add_parser('hash-object', help='create a blob')
+    hashObjParser.add_argument('-w', help='write object in database',
+                               action='store_true', default=False)
+    hashObjParser.add_argument('file', help='file to store', action='store',
+                               type=str)
 
-    elif command == "ls-tree":
-        param, hash = sys.argv[2], sys.argv[3]
-        if(param == '--name-only'):
-            with open(f".git/objects/{hash[:2]}/{hash[2:]}", "rb") as f:
-                data = zlib.decompress(f.read())
-                _, binary_data = data.split(b'\x00', maxsplit=1)
-                while binary_data:
-                    mode, binary_data = binary_data.split(b'\x00', maxsplit=1)
-                    _, name = mode.split()
-                    binary_data = binary_data[20:]
-                    print(name.decode('utf-8'))
+    # ls-tree
+    lsTreeParser = cmdParser.add_parser('ls-tree', help='list tree')
+    lsTreeParser.add_argument('--name-only', help='list only filenames',
+                              action='store_true', default=False)
+    lsTreeParser.add_argument('tree', help='tree hash', type=str)
 
-    elif command == 'write-tree':
-        print(write_tree())
-    elif command == 'commit-tree':
-        tree_sha, parent_sha, message = sys.argv[2], sys.argv[4], sys.argv[6]
-        print(commit_tree(tree_sha, parent_sha, message)) 
+    # write-tree
+    cmdParser.add_parser('write-tree', help='write tree')
+
+    # commit-tree
+    commitParser = cmdParser.add_parser('commit-tree', help='commit')
+    commitParser.add_argument('tree', help='tree sha', type=str)
+    commitParser.add_argument('-p', help='parent commit', dest='parent',
+                              type=str, action='store')
+    commitParser.add_argument('-m', help='message', dest='msg',
+                              type=str, action='store')
+
+    # clone
+    cloneParser = cmdParser.add_parser('clone', help='clone repo')
+    cloneParser.add_argument('url', help='repo url', type=str, action='store')
+    cloneParser.add_argument('dir', help='directory', type=str, action='store')
+
+    args = parser.parse_args()
+    if args.cmd == 'init':
+        initCmd()
+    elif args.cmd == 'cat-file':
+        catFile(args.blob, verbose=True)
+    elif args.cmd == 'hash-object':
+        hashObj(args.file, verbose=True)
+    elif args.cmd == 'ls-tree':
+        lstree(args.tree)
+    elif args.cmd == 'write-tree':
+        writeTree(verbose=True)
+    elif args.cmd == 'commit-tree':
+        commit(args.tree, args.parent, args.msg)
+    elif args.cmd == 'clone':
+        clone(args.url, args.dir)
     else:
-        raise RuntimeError(f"Unknown command #{command}")
-    
-
-
+        parser.print_usage()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
